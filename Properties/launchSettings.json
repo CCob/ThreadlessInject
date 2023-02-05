@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "ThreadlessInject": {
+      "commandName": "Project",
+      "commandLineArgs": "-e CreateEventW -d kernelbase.dll -p 17892 -x \"C:\\Users\\ceri.coburn\\Documents\\Reports\\BCG\\RT 2022\\beacon64_np.bin\""
+    }
+  }
+}
