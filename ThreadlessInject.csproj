@@ -2,7 +2,25 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net462</TargetFramework>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>10</LangVersion>
   </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+    <PlatformTarget>AnyCPU</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="ConsoleApplication1\**" />
+    <None Remove="Needles without the Thread.pptx" />
+    <None Remove="README.md" />
+    <None Remove=".gitattributes" />
+    <None Remove=".gitignore" />
+    <None Remove="LICENSE.txt" />
+  </ItemGroup>
 
 </Project>

