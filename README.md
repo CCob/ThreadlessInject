@@ -11,7 +11,7 @@ From my Bsides Cymru 2023 talk: **[Needles Without the Thread](https://pretalx.c
 
 ## Possible Improvements
 
-- [ ] Use more covert allocation and write primitives.
+- [x] Use more covert allocation and write primitives.
 - [ ] Use patchless hooking via debugger attachment and hardware breakpoints [(https://www.pentestpartners.com/security-blog/patchless-amsi-bypass-using-sharpblock)](https://www.pentestpartners.com/security-blog/patchless-amsi-bypass-using-sharpblock/).
 - [ ] Avoid RWX on hooked function.  Hook assembly will need to handle VirtualProtect calls.
 - [ ] Support any DLL via remote module enumeration.
