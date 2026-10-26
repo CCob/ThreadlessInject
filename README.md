@@ -9,9 +9,26 @@ From my Bsides Cymru 2023 talk: **[Needles Without the Thread](https://pretalx.c
 > Within the last 2 years, tools such as Sysmon have added new detections and events for process injection along with big improvements in detections within commercial EDR space.
 > With this in mind, a new method of injection was researched that would not fall foul to the traditional methods that are often detected today.
 
+# Usage
+
+```powershell
+# inject calc-loader-shellcode into Chrome's kernelbase.dll!CreateEventW
+.\ThreadlessInject.exe -p (Get-Process "Chrome").id -d kernelbase.dll -e CreateEventW
+```
+
+```powershell
+# inject ret-0-shellcode into Notepads's kernelbase.dll!MapViewOfFileEx
+.\ThreadlessInject.exe -p (Get-Process "Notepad").id -d kernelbase.dll -e MapViewOfFileEx -x "SDHAww=="
+```
+
+```powershell
+# inject calc-loader-shellcode into Notepads's kernelbase.dll!MapViewOfFileEx searching for a code cave in a random remote DLL
+.\ThreadlessInject.exe -p (Get-Process "Notepad").id -d kernelbase.dll -e MapViewOfFileEx -c -r
+```
+
 ## Possible Improvements
 
 - [x] Use more covert allocation and write primitives.
 - [ ] Use patchless hooking via debugger attachment and hardware breakpoints [(https://www.pentestpartners.com/security-blog/patchless-amsi-bypass-using-sharpblock)](https://www.pentestpartners.com/security-blog/patchless-amsi-bypass-using-sharpblock/).
-- [ ] Avoid RWX on hooked function.  Hook assembly will need to handle VirtualProtect calls.
-- [ ] Support any DLL via remote module enumeration.
+- [x] Avoid RWX on hooked function.  Hook assembly will need to handle VirtualProtect calls.
+- [x] Support any DLL via remote module enumeration.

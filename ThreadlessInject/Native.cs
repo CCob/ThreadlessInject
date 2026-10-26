@@ -34,15 +34,13 @@ public static class Native
             ref cid);
     }
 
-    public static NTSTATUS AllocateVirtualMemory(IntPtr hProcess, ulong address, int size)
+    public static NTSTATUS AllocateVirtualMemory(IntPtr hProcess, ref IntPtr address, IntPtr size)
     {
-        var baseAddress = (IntPtr)address;
-        var regionSize = (IntPtr)size;
         return NtAllocateVirtualMemory(
             hProcess,
-            ref baseAddress,
+            ref address,
             IntPtr.Zero,
-            ref regionSize,
+            ref size,
             Win32.MemoryAllocation.Commit | Win32.MemoryAllocation.Reserve,
             Win32.MemoryProtection.ExecuteRead);
     }
